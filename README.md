@@ -1,0 +1,1 @@
+# esp32-c3-xiaomi-mija-bluetooth-thermometer-3
