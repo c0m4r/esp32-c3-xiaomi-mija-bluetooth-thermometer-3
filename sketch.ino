@@ -233,21 +233,73 @@ void publishAllCachedData() {
   client.loop();
 }
 
+// Timeout wrapper for BLE connection operations
+bool connectWithTimeout(BLEClient *pClient, const char *address,
+                        int timeoutMs) {
+  unsigned long startTime = millis();
+
+  // Set shorter MTU to speed up connection
+  pClient->setClientCallbacks(nullptr);
+
+  // Try to connect - this can sometimes hang
+  bool connected = pClient->connect(BLEAddress(address), BLE_ADDR_TYPE_PUBLIC);
+
+  if (!connected) {
+    return false;
+  }
+
+  // Verify we're actually connected (sometimes connect returns true but isn't
+  // stable)
+  if (!pClient->isConnected()) {
+    return false;
+  }
+
+  return true;
+}
+
 bool connectAndRead(const char *address, const char *name) {
   Serial.printf("Connecting to %s (%s)... ", name, address);
 
   BLEClient *pClient = BLEDevice::createClient();
 
-  // Connect with timeout (in seconds)
-  if (!pClient->connect(BLEAddress(address), BLE_ADDR_TYPE_PUBLIC,
-                        connectTimeout * 1000)) {
-    Serial.println("Failed to connect");
+  unsigned long connectStart = millis();
+  bool connected = false;
+
+  // Attempt connection with overall timeout protection
+  connected = pClient->connect(BLEAddress(address), BLE_ADDR_TYPE_PUBLIC);
+
+  // Check if connection took too long or failed
+  if (!connected || (millis() - connectStart > connectTimeout * 1000)) {
+    if (connected) {
+      Serial.println("Connection timeout - cleaning up");
+      pClient->disconnect();
+    } else {
+      Serial.println("Failed to connect");
+    }
     delete pClient;
     return false;
   }
+
+  // Double-check connection status
+  if (!pClient->isConnected()) {
+    Serial.println("Connection lost immediately");
+    delete pClient;
+    return false;
+  }
+
   Serial.println("Connected");
 
+  // Get service with timeout check
+  unsigned long serviceStart = millis();
   BLERemoteService *pRemoteService = pClient->getService(serviceUUID);
+
+  if (millis() - serviceStart > 5000) {
+    Serial.println("Service discovery timeout");
+    pClient->disconnect();
+    delete pClient;
+    return false;
+  }
+
   if (pRemoteService == nullptr) {
     Serial.println("Service not found");
     pClient->disconnect();
@@ -255,8 +307,18 @@ bool connectAndRead(const char *address, const char *name) {
     return false;
   }
 
+  // Get characteristic with timeout check
+  unsigned long charStart = millis();
   BLERemoteCharacteristic *pRemoteCharacteristic =
       pRemoteService->getCharacteristic(charUUID);
+
+  if (millis() - charStart > 5000) {
+    Serial.println("Characteristic discovery timeout");
+    pClient->disconnect();
+    delete pClient;
+    return false;
+  }
+
   if (pRemoteCharacteristic == nullptr) {
     Serial.println("Characteristic not found");
     pClient->disconnect();
@@ -269,9 +331,15 @@ bool connectAndRead(const char *address, const char *name) {
 
     Serial.println("Waiting for data...");
     dataReceived = false;
-    long startTime = millis();
+    unsigned long startTime = millis();
     while (!dataReceived && millis() - startTime < 10000) {
       delay(100);
+      // Also check if we lost connection
+      if (!pClient->isConnected()) {
+        Serial.println("Connection lost while waiting for data");
+        delete pClient;
+        return false;
+      }
     }
 
     if (!dataReceived) {
